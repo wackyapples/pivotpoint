@@ -13,11 +13,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger("redirect_server")
+logger = logging.getLogger("pivotpoint")
 
 
 @dataclass
@@ -41,11 +40,50 @@ class RedirectRule:
         return hash((self.target_url, self.preserve_path, self.https_first))
 
 
+class RedirectRules:
+    """Container for redirect rules with optimized matching."""
+
+    def __init__(self):
+        self.exact_rules: dict[str, RedirectRule] = {}
+        self.wildcard_rules: dict[str, RedirectRule] = {}
+        self.default_rule: RedirectRule | None = None
+
+    def add_rule(self, pattern: str, rule: RedirectRule):
+        """Add a rule to the appropriate collection based on pattern type."""
+        if pattern == "default":
+            self.default_rule = rule
+        elif pattern.startswith("*."):
+            self.wildcard_rules[pattern[2:]] = rule  # Store without the "*." prefix
+        else:
+            self.exact_rules[pattern] = rule
+
+    @lru_cache(maxsize=128)
+    def get_rule(self, host: str) -> RedirectRule | None:
+        """Get the matching rule for a host using optimized matching."""
+        # Try exact match first
+        if rule := self.exact_rules.get(host):
+            return rule
+
+        # Try wildcard match using domain parts
+        domain_parts = host.split(".")
+        for i in range(len(domain_parts) - 1):
+            suffix = ".".join(domain_parts[i:])
+            if rule := self.wildcard_rules.get(suffix):
+                return rule
+
+        # Fall back to default rule
+        return self.default_rule
+
+    @lru_cache(maxsize=128)
+    def __getitem__(self, host: str) -> RedirectRule | None:
+        return self.get_rule(host)
+
+
 class RedirectHandler(http.server.BaseHTTPRequestHandler):
     """Handler for HTTP requests that performs redirects based on the Host header."""
 
     server: "SNITCPServer"
-    redirection_rules: dict[str, RedirectRule]
+    redirection_rules: RedirectRules
     server_config: dict[str, Any]
 
     def __init__(self, *args, **kwargs):
@@ -99,18 +137,20 @@ class RedirectHandler(http.server.BaseHTTPRequestHandler):
 
     def perform_redirect(self, host: str):
         """Perform redirection based on host header to the configured destination."""
-        rule = self.redirection_rules.get(host, self.redirection_rules.get("default"))
-        if not rule:
-            logger.warning(f"No destination found for host: {host}")
-            self.send_response(404)
-            self.end_headers()
+        rule = self.redirection_rules.get_rule(host)
+        if rule:
+            self._apply_redirect(rule, host)
             return
 
+        logger.warning(f"No destination found for host: {host}")
+        self.send_response(404)
+        self.end_headers()
+
+    def _apply_redirect(self, rule: RedirectRule, host: str):
+        """Apply the redirect rule to the current request."""
         if rule.https_first and not self.is_ssl_connection:
             self.redirect_to_https()
             return
-        else:
-            logger.info(f"{rule.https_first = } {self.is_ssl_connection = }")
 
         full_url = (
             rule.get_redirect_url(self.path)
@@ -130,10 +170,6 @@ class RedirectHandler(http.server.BaseHTTPRequestHandler):
     # Override to suppress request logging to stderr
     def log_message(self, format, *args):
         pass
-
-    def version_string(self):
-        return f"PivotPoint/0.1 {self.sys_version}"
-
 
 class SNITCPServer(socketserver.ThreadingTCPServer):
     """
@@ -248,10 +284,9 @@ def parse_config_line(line: str) -> tuple[str, str, list[str]]:
     return parts[0], parts[1], parts[2:]
 
 
-@lru_cache(maxsize=1)
-def load_redirection_rules(config_file: str | Path) -> dict[str, RedirectRule]:
+def load_redirection_rules(config_file: str | Path) -> RedirectRules:
     """
-    Parse the configuration file and return a dictionary of host to RedirectRule.
+    Parse the configuration file and return a RedirectRules object.
     Format: source_domain target_url [options...]
     """
     if not isinstance(config_file, Path):
@@ -259,9 +294,9 @@ def load_redirection_rules(config_file: str | Path) -> dict[str, RedirectRule]:
 
     if not config_file.exists():
         logger.warning(f"Configuration file not found: {config_file}")
-        return {}
+        return RedirectRules()
 
-    rules = {}
+    rules = RedirectRules()
     with config_file.open("r") as f:
         for line in f:
             line = line.strip()
@@ -301,12 +336,13 @@ def load_redirection_rules(config_file: str | Path) -> dict[str, RedirectRule]:
                     value = option.split("=")[1].lower()
                     https_first = value == "yes"
 
-            rules[host] = RedirectRule(
+            rule = RedirectRule(
                 target_url=target_url,
                 redirect_type=redirect_type,
                 preserve_path=preserve_path,
                 https_first=https_first,
             )
+            rules.add_rule(host, rule)
 
     return rules
 
@@ -334,14 +370,9 @@ def load_cert_context(cert_file: str | Path, key_file: str | Path) -> ssl.SSLCon
 
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
 
-    # Configure with modern ciphers and protocols
-    # Disable older, insecure protocols
     context.minimum_version = ssl.TLSVersion.TLSv1_1
-
-    # Use server's preferred cipher suites
     context.options |= ssl.OP_CIPHER_SERVER_PREFERENCE
 
-    # Load certificate and private key
     context.load_cert_chain(certfile=cert_file, keyfile=key_file)
 
     return context
@@ -433,7 +464,6 @@ def get_args():
 
 def main():
     """Main function to start the redirection server with SNI support."""
-    # Server configuration
     args = get_args()
     https_port = args.https_port
     http_port = args.http_port
@@ -446,10 +476,8 @@ def main():
     }
 
     try:
-        # Load certificate mappings and default context
         cert_mappings, default_context = load_cert_mappings(args.certs)
 
-        # Create the HTTPS server with SNI support
         handler = RedirectHandler
         https_server = SNITCPServer(
             (args.host, https_port),
@@ -460,12 +488,10 @@ def main():
             default_context,
         )
 
-        # Create an HTTP server that will redirect to HTTPS
         http_server = SNITCPServer(
             (args.host, http_port), handler, args.redirects, {}, server_config, None
         )
 
-        # Start HTTP server in a separate thread
         http_thread = threading.Thread(target=http_server.serve_forever, daemon=True)
         http_thread.start()
 
@@ -478,7 +504,6 @@ def main():
         )
         logger.info("Press Ctrl+C to stop the server")
 
-        # Start the HTTPS server in the main thread
         https_server.serve_forever()
 
     except KeyboardInterrupt:

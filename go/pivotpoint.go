@@ -6,7 +6,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-// RedirectRule represents configuration for a single redirect rule
+// Configuration for a single redirect rule
 type RedirectRule struct {
 	TargetURL     string
 	RedirectType  int
@@ -28,20 +28,34 @@ type RedirectRule struct {
 	parsedTargetM sync.Once
 }
 
-// ServerConfig holds the server configuration
 type ServerConfig struct {
 	HTTPPort  int
 	HTTPSPort int
 	Host      string
 }
 
-// RedirectHandler handles HTTP requests and performs redirects based on Host header
+// RedirectRules container for optimized rule matching
+type RedirectRules struct {
+	exactRules    map[string]*RedirectRule
+	wildcardRules map[string]*RedirectRule
+	defaultRule   *RedirectRule
+}
+
+// NewRedirectRules creates a new RedirectRules container
+func NewRedirectRules() *RedirectRules {
+	return &RedirectRules{
+		exactRules:    make(map[string]*RedirectRule),
+		wildcardRules: make(map[string]*RedirectRule),
+	}
+}
+
+// Handler for HTTP requests and performs redirects based on Host header
 type RedirectHandler struct {
-	redirectionRules map[string]*RedirectRule
+	redirectionRules *RedirectRules
 	serverConfig     *ServerConfig
 }
 
-// SNIServer represents a TCP server with SNI support
+// Server with SNI support (to be used later)
 type SNIServer struct {
 	httpServer  *http.Server
 	httpsServer *http.Server
@@ -49,7 +63,7 @@ type SNIServer struct {
 	defaultCert *tls.Config
 }
 
-// NewRedirectRule creates a new RedirectRule with default values
+// Create a new RedirectRule with default values
 func NewRedirectRule(targetURL string) *RedirectRule {
 	return &RedirectRule{
 		TargetURL:    targetURL,
@@ -59,12 +73,43 @@ func NewRedirectRule(targetURL string) *RedirectRule {
 	}
 }
 
-// GetRedirectURL returns the final redirect URL based on the configuration
+// AddRule adds a rule to the appropriate collection based on pattern type
+func (r *RedirectRules) AddRule(pattern string, rule *RedirectRule) {
+	if pattern == "default" {
+		r.defaultRule = rule
+	} else if strings.HasPrefix(pattern, "*.") {
+		r.wildcardRules[pattern[2:]] = rule // Store without the "*." prefix
+	} else {
+		r.exactRules[pattern] = rule
+	}
+}
+
+// GetRule gets the matching rule for a host using optimized matching
+func (r *RedirectRules) GetRule(host string) *RedirectRule {
+	// Exact match
+	if rule, exists := r.exactRules[host]; exists {
+		return rule
+	}
+
+	// Wildcard match
+	domainParts := strings.Split(host, ".")
+	for i := range len(domainParts) - 1 {
+		suffix := strings.Join(domainParts[i:], ".")
+		if rule, exists := r.wildcardRules[suffix]; exists {
+			return rule
+		}
+	}
+
+	// Default rule
+	return r.defaultRule
+}
+
+// Get the final redirect URL based on the configuration
 func (r *RedirectRule) GetRedirectURL(originalPath string) string {
 	r.parsedTargetM.Do(func() {
 		parsed, err := url.Parse(r.TargetURL)
 		if err != nil {
-			log.Printf("Error parsing target URL: %v", err)
+			slog.Error("Error parsing target URL", "error", err)
 			return
 		}
 		r.parsedTarget = parsed
@@ -80,21 +125,22 @@ func (r *RedirectRule) GetRedirectURL(originalPath string) string {
 	return r.TargetURL
 }
 
-// ServeHTTP implements the http.Handler interface
+// Implement the http.Handler interface for the RedirectHandler
 func (h *RedirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := strings.Split(r.Host, ":")[0] // Remove port if present
 
-	// Get the redirect rule for this host
-	rule, exists := h.redirectionRules[host]
-	if !exists {
-		rule, exists = h.redirectionRules["default"]
-		if !exists {
-			http.Error(w, "Not Found", http.StatusNotFound)
-			log.Printf("No destination found for host: %s", host)
-			return
-		}
+	rule := h.redirectionRules.GetRule(host)
+	if rule != nil {
+		h.applyRedirect(w, r, rule, host)
+		return
 	}
 
+	http.Error(w, "Not Found", http.StatusNotFound)
+	slog.Error("No destination found for host", "host", host)
+}
+
+// Apply the redirect rule to the current request
+func (h *RedirectHandler) applyRedirect(w http.ResponseWriter, r *http.Request, rule *RedirectRule, host string) {
 	// Handle HTTPS first redirect if needed
 	if rule.HTTPSFirst && r.TLS == nil {
 		httpsURL := fmt.Sprintf("https://%s:%d%s", host, h.serverConfig.HTTPSPort, r.URL.Path)
@@ -102,29 +148,29 @@ func (h *RedirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			httpsURL += "?" + r.URL.RawQuery
 		}
 		http.Redirect(w, r, httpsURL, http.StatusMovedPermanently)
-		log.Printf("Redirected HTTP request for %s%s to HTTPS %s", r.Host, r.URL.Path, httpsURL)
+		slog.Info("Redirected HTTP request", "host", r.Host, "path", r.URL.Path, "httpsURL", httpsURL)
 		return
 	}
 
-	// Perform the redirect
+	// Perform the redirect for real
 	redirectURL := rule.GetRedirectURL(r.URL.Path)
 	if r.URL.RawQuery != "" {
 		redirectURL += "?" + r.URL.RawQuery
 	}
 
 	http.Redirect(w, r, redirectURL, rule.RedirectType)
-	log.Printf("Redirected %s%s to %s (type: %d)", r.Host, r.URL.Path, redirectURL, rule.RedirectType)
+	slog.Info("Redirected", "host", r.Host, "path", r.URL.Path, "redirectURL", redirectURL, "type", rule.RedirectType)
 }
 
-// loadRedirectionRules loads and parses the redirect configuration file
-func loadRedirectionRules(configFile string) (map[string]*RedirectRule, error) {
+// Load and parse the redirect configuration file
+func loadRedirectionRules(configFile string) (*RedirectRules, error) {
 	file, err := os.Open(configFile)
 	if err != nil {
 		return nil, fmt.Errorf("error opening config file: %v", err)
 	}
 	defer file.Close()
 
-	rules := make(map[string]*RedirectRule)
+	rules := NewRedirectRules()
 	scanner := bufio.NewScanner(file)
 
 	for scanner.Scan() {
@@ -135,19 +181,20 @@ func loadRedirectionRules(configFile string) (map[string]*RedirectRule, error) {
 
 		parts := strings.Fields(line)
 		if len(parts) < 2 {
-			log.Printf("Invalid line in config: %s", line)
+			slog.Error("Invalid line in config", "line", line)
 			continue
 		}
 
 		host := parts[0]
 		targetURL := parts[1]
 		rule := NewRedirectRule(targetURL)
+		slog.Debug("Adding rule", "host", host, "target", targetURL)
 
 		// Parse options
 		for _, opt := range parts[2:] {
 			optParts := strings.Split(opt, "=")
 			if len(optParts) != 2 {
-				log.Printf("Invalid option: %s", opt)
+				slog.Error("Invalid option", "option", opt)
 				continue
 			}
 
@@ -165,13 +212,13 @@ func loadRedirectionRules(configFile string) (map[string]*RedirectRule, error) {
 			}
 		}
 
-		rules[host] = rule
+		rules.AddRule(host, rule)
 	}
 
 	return rules, scanner.Err()
 }
 
-// loadCertMappings loads certificate configurations from the specified file
+// Load certificate configurations from the specified file
 func loadCertMappings(configFile string) (map[string]*tls.Config, *tls.Config, error) {
 	file, err := os.Open(configFile)
 	if err != nil {
@@ -191,7 +238,7 @@ func loadCertMappings(configFile string) (map[string]*tls.Config, *tls.Config, e
 
 		parts := strings.Fields(line)
 		if len(parts) != 3 {
-			log.Printf("Invalid line in cert config: %s", line)
+			slog.Error("Invalid line in cert config", "line", line)
 			continue
 		}
 
@@ -201,7 +248,7 @@ func loadCertMappings(configFile string) (map[string]*tls.Config, *tls.Config, e
 
 		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
-			log.Printf("Error loading certificate for %s: %v", host, err)
+			slog.Error("Error loading certificate", "host", host, "error", err)
 			continue
 		}
 
@@ -214,14 +261,15 @@ func loadCertMappings(configFile string) (map[string]*tls.Config, *tls.Config, e
 			defaultCert = config
 		} else {
 			certMaps[host] = config
-			log.Printf("Loaded certificate for %s: %s", host, certFile)
+			slog.Debug("Loaded certificate", "host", host, "cert", certFile)
 		}
 	}
 
 	return certMaps, defaultCert, scanner.Err()
 }
 
-func runServers(config *ServerConfig, rules map[string]*RedirectRule, certMaps map[string]*tls.Config, defaultCert *tls.Config) {
+// Run the HTTP and HTTPS servers in parallel
+func runServers(config *ServerConfig, rules *RedirectRules, certMaps map[string]*tls.Config, defaultCert *tls.Config) {
 	handler := &RedirectHandler{
 		redirectionRules: rules,
 		serverConfig:     config,
@@ -247,7 +295,7 @@ func runServers(config *ServerConfig, rules map[string]*RedirectRule, certMaps m
 		},
 	}
 
-	// Create a channel to receive OS signals
+	// Create a channel to receive SIGINT and SIGTERM signals
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
@@ -257,45 +305,43 @@ func runServers(config *ServerConfig, rules map[string]*RedirectRule, certMaps m
 	// Start HTTP server
 	go func() {
 		defer wg.Done()
-		log.Printf("Starting HTTP server on %s", httpAddr)
+		slog.Info("Starting HTTP server", "addr", httpAddr)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("HTTP server error: %v", err)
+			slog.Error("HTTP server error", "error", err)
 		}
-		log.Printf("HTTP server closed")
+		slog.Info("HTTP server closed")
 	}()
 
 	// Start HTTPS server
 	go func() {
 		defer wg.Done()
-		log.Printf("Starting HTTPS server on %s", httpsAddr)
+		slog.Info("Starting HTTPS server", "addr", httpsAddr)
 		if err := httpsServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-			log.Printf("HTTPS server error: %v", err)
+			slog.Error("HTTPS server error", "error", err)
 		}
-		log.Printf("HTTPS server closed")
+		slog.Info("HTTPS server closed")
 	}()
 
 	// Wait for interrupt signal
 	<-stop
-	log.Printf("Received shutdown signal, initiating graceful shutdown...")
+	slog.Info("Received shutdown signal, initiating graceful shutdown...")
 
-	// Create shutdown context with timeout
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// Attempt graceful shutdown of both servers
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		log.Printf("HTTP server forced to shutdown: %v", err)
+		slog.Error("HTTP server forced to shutdown", "error", err)
 	}
 
 	if err := httpsServer.Shutdown(shutdownCtx); err != nil {
-		log.Printf("HTTPS server forced to shutdown: %v", err)
+		slog.Error("HTTPS server forced to shutdown", "error", err)
 	}
 
 	// Wait for servers to finish
 	wg.Wait()
-	log.Printf("Servers shutdown completed")
+	slog.Info("Servers shutdown completed")
 }
-
 
 func main() {
 	// Parse command line arguments
@@ -304,10 +350,23 @@ func main() {
 	httpPort := flag.Int("http-port", 8080, "HTTP port to listen on")
 	httpsPort := flag.Int("https-port", 8443, "HTTPS port to listen on")
 	host := flag.String("host", "", "Host to listen on")
+	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	flag.Parse()
 
+	var level slog.Level
+	err := level.UnmarshalText([]byte(*logLevel))
+	if err != nil {
+		slog.Error("Invalid log level", "error", err)
+		os.Exit(1)
+	}
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: level,
+	})))
+
 	if *redirectsFile == "" || *certsFile == "" {
-		log.Fatal("Both --redirects and --certs flags are required")
+		slog.Error("Both --redirects and --certs flags are required")
+		os.Exit(1)
 	}
 
 	// Initialize server configuration
@@ -320,13 +379,15 @@ func main() {
 	// Load redirect rules
 	rules, err := loadRedirectionRules(*redirectsFile)
 	if err != nil {
-		log.Fatalf("Error loading redirect rules: %v", err)
+		slog.Error("Error loading redirect rules", "error", err)
+		os.Exit(1)
 	}
 
 	// Load certificate mappings
 	certMaps, defaultCert, err := loadCertMappings(*certsFile)
 	if err != nil {
-		log.Fatalf("Error loading certificate mappings: %v", err)
+		slog.Error("Error loading certificate mappings", "error", err)
+		os.Exit(1)
 	}
 
 	runServers(config, rules, certMaps, defaultCert)
