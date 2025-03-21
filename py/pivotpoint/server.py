@@ -1,8 +1,4 @@
-#!/usr/bin/env python3
-
-import argparse
 import http.server
-import logging
 import socket
 import socketserver
 import ssl
@@ -13,10 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger("pivotpoint")
+import slog
 
 
 @dataclass
@@ -171,6 +164,7 @@ class RedirectHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+
 class SNITCPServer(socketserver.ThreadingTCPServer):
     """
     TCP Server with SNI support to serve multiple TLS certificates based on hostname.
@@ -228,7 +222,7 @@ class SNITCPServer(socketserver.ThreadingTCPServer):
             ssl_context: The SSL context
         """
         self.sni_server_name = server_name
-        logger.info(f"SNI callback received hostname: {server_name}")
+        slog.info("SNI callback received hostname", server_name=server_name)
 
         # If we have a specific context for this hostname, use it
         if server_name and server_name in self.cert_mappings:
@@ -263,14 +257,14 @@ class SNITCPServer(socketserver.ThreadingTCPServer):
                     continue
 
         except ssl.SSLError as e:
-            logger.error(f"TLS handshake error: {e}")
+            slog.error("TLS handshake error", error=str(e))
             newsocket.close()
             raise
 
         server_name = self.sni_server_name
 
         if server_name:
-            logger.info(f"Using certificate for SNI hostname: {server_name}")
+            slog.info("Using certificate for SNI hostname", server_name=server_name)
 
         return ssl_socket, fromaddr
 
@@ -279,7 +273,7 @@ def parse_config_line(line: str) -> tuple[str, str, list[str]]:
     """Parse a line of the configuration file and return a tuple of host, target_url, and options."""
     parts = line.split()
     if len(parts) < 2:
-        logger.warning(f"Invalid line in config: {line}")
+        slog.warn("Invalid line in config", line=line)
         return None, None, []
     return parts[0], parts[1], parts[2:]
 
@@ -293,7 +287,7 @@ def load_redirection_rules(config_file: str | Path) -> RedirectRules:
         config_file = Path(config_file)
 
     if not config_file.exists():
-        logger.warning(f"Configuration file not found: {config_file}")
+        slog.warn("Configuration file not found", file=str(config_file))
         return RedirectRules()
 
     rules = RedirectRules()
@@ -318,13 +312,13 @@ def load_redirection_rules(config_file: str | Path) -> RedirectRules:
                     try:
                         redirect_type = int(option.split("=")[1])
                         if redirect_type not in (301, 302):
-                            logger.warning(
-                                f"Invalid redirect type for {host}: {redirect_type}"
+                            slog.warn(
+                                "Invalid redirect type", host=host, type=redirect_type
                             )
                             continue
                     except ValueError:
-                        logger.warning(
-                            f"Invalid redirect type format for {host}: {option}"
+                        slog.warn(
+                            "Invalid redirect type format", host=host, option=option
                         )
                         continue
 
@@ -365,14 +359,15 @@ def load_cert_context(cert_file: str | Path, key_file: str | Path) -> ssl.SSLCon
         key_file = Path(key_file)
 
     if not cert_file.exists() or not key_file.exists():
-        logger.error(f"Certificate ({cert_file}) or key ({key_file}) file not found")
+        slog.error(
+            "Certificate or key file not found",
+            cert_file=str(cert_file),
+            key_file=str(key_file),
+        )
         raise FileNotFoundError(f"Certificate or key file not found")
 
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-
-    context.minimum_version = ssl.TLSVersion.TLSv1_1
     context.options |= ssl.OP_CIPHER_SERVER_PREFERENCE
-
     context.load_cert_chain(certfile=cert_file, keyfile=key_file)
 
     return context
@@ -394,7 +389,7 @@ def load_cert_mappings(
         config_file = Path(config_file)
 
     if not config_file.exists():
-        logger.warning(f"Certificate configuration file not found: {config_file}")
+        slog.warn("Certificate configuration file not found", file=str(config_file))
         return {}, None
 
     cert_mappings: dict[str, ssl.SSLContext] = {}
@@ -415,117 +410,102 @@ def load_cert_mappings(
             try:
                 context = load_cert_context(cert_file, key_file)
                 cert_mappings[host] = context
-                logger.info(f"Loaded certificate for {host}: {cert_file}")
+                slog.info("Loaded certificate", host=host, cert_file=cert_file)
             except Exception as e:
-                logger.error(f"Error loading certificate for {host}: {e}")
+                slog.error("Error loading certificate", host=host, error=str(e))
 
     return cert_mappings, default_context
 
 
-def get_args():
-    parser = argparse.ArgumentParser(description="PivotPoint server")
-    parser.add_argument(
-        "--redirects",
-        "-r",
-        type=str,
-        required=True,
-        help="Redirects configuration file",
-    )
-    parser.add_argument(
-        "--certs",
-        "-c",
-        type=str,
-        required=True,
-        help="Certificates configuration file",
-    )
-    parser.add_argument(
-        "--http-port",
-        "-p",
-        type=int,
-        default=8080,
-        help="HTTP port to listen on",
-    )
-    parser.add_argument(
-        "--https-port",
-        "-s",
-        type=int,
-        default=8443,
-        help="HTTPS port to listen on",
-    )
-    parser.add_argument(
-        "--host",
-        "-H",
-        type=str,
-        default="",
-        help="Host to listen on",
-    )
-    return parser.parse_args()
+def load_server_config(config_file: str | Path) -> dict[str, Any]:
+    """
+    Load server configuration from a file.
+    """
+    if not isinstance(config_file, Path):
+        config_file = Path(config_file)
+
+    if not config_file.exists():
+        slog.warn("Server configuration file not found", file=str(config_file))
+        return {}
+
+    server_config = {}
+
+    with config_file.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, value = line.split(" ", 1)
+            server_config[key] = value
+
+    return server_config
 
 
-def main():
-    """Main function to start the redirection server with SNI support."""
-    args = get_args()
-    https_port = args.https_port
-    http_port = args.http_port
-    https_server = None
-    http_server = None
-    http_thread = None
-    server_config = {
-        "https_port": https_port,
-        "http_port": http_port,
-    }
-
+def run_server(server_config: dict[str, Any]):
+    """
+    Run the server with the given configuration.
+    """
     try:
-        cert_mappings, default_context = load_cert_mappings(args.certs)
+        cert_mappings, default_context = load_cert_mappings(server_config["certs_file"])
+
+        redirects = load_redirection_rules(server_config["redirects_file"])
 
         handler = RedirectHandler
         https_server = SNITCPServer(
-            (args.host, https_port),
+            (server_config["host"], server_config["https_port"]),
             handler,
-            args.redirects,
+            redirects,
             cert_mappings,
             server_config,
             default_context,
         )
 
         http_server = SNITCPServer(
-            (args.host, http_port), handler, args.redirects, {}, server_config, None
+            (server_config["host"], server_config["http_port"]),
+            handler,
+            redirects,
+            {},
+            server_config,
+            None,
         )
 
         http_thread = threading.Thread(target=http_server.serve_forever, daemon=True)
         http_thread.start()
 
-        logger.info(f"Starting HTTP redirect server on port {http_port}")
-        logger.info(
-            f"Starting secure redirect server with SNI support on port {https_port}"
+        slog.info(
+            "Starting HTTP redirect server",
+            host=server_config["host"],
+            port=server_config["http_port"],
         )
-        logger.info(
-            f"Loaded certificates for {len(cert_mappings)} hostnames plus default"
+        slog.info(
+            "Starting secure redirect server with SNI support",
+            host=server_config["host"],
+            port=server_config["https_port"],
         )
-        logger.info("Press Ctrl+C to stop the server")
+        slog.info(
+            "Loaded certificates",
+            count=len(cert_mappings),
+            has_default=bool(default_context),
+        )
+        slog.info("Press Ctrl+C to stop the server")
 
         https_server.serve_forever()
 
     except KeyboardInterrupt:
-        logger.info("Server stopped by user")
+        slog.info("Server stopped by user")
     except Exception as e:
-        logger.error(f"Error starting server: {e}")
+        slog.error("Error starting server", error=str(e))
     finally:
-
         if https_server:
-            logger.info("Shutting down HTTPS server...")
+            slog.info("Shutting down HTTPS server...")
             https_server.shutdown()
             https_server.server_close()
-            logger.info("HTTPS server closed")
+            slog.info("HTTPS server closed")
 
         if http_server:
-            logger.info("Shutting down HTTP server...")
+            slog.info("Shutting down HTTP server...")
             http_server.shutdown()
             http_server.server_close()
-            logger.info("HTTP server closed")
+            slog.info("HTTP server closed")
 
-        logger.info("All servers closed")
-
-
-if __name__ == "__main__":
-    main()
+        slog.info("All servers closed")
