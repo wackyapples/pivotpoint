@@ -345,16 +345,27 @@ func runServers(config *ServerConfig, rules *RedirectRules, certMaps map[string]
 
 func main() {
 	// Parse command line arguments
-	redirectsFile := flag.String("redirects", "", "Redirects configuration file")
-	certsFile := flag.String("certs", "", "Certificates configuration file")
-	httpPort := flag.Int("http-port", 8080, "HTTP port to listen on")
-	httpsPort := flag.Int("https-port", 8443, "HTTPS port to listen on")
-	host := flag.String("host", "", "Host to listen on")
-	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+	var redirectsFile string
+	var certsFile string
+	var httpPort int
+	var httpsPort int
+	var host string
+	var logLevel string
+	flag.StringVar(&redirectsFile, "redirects", "", "Redirects configuration file")
+	flag.StringVar(&redirectsFile, "r", "", "Redirects configuration file")
+	flag.StringVar(&certsFile, "certs", "", "Certificates configuration file")
+	flag.StringVar(&certsFile, "c", "", "Certificates configuration file")
+	flag.IntVar(&httpPort, "http-port", 8080, "HTTP port to listen on")
+	flag.IntVar(&httpPort, "p", 8080, "HTTP port to listen on")
+	flag.IntVar(&httpsPort, "https-port", 8443, "HTTPS port to listen on")
+	flag.StringVar(&host, "host", "", "Host to listen on")
+	flag.StringVar(&host, "H", "", "Host to listen on")
+	flag.StringVar(&logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
+	flag.StringVar(&logLevel, "l", "info", "Log level (debug, info, warn, error)")
 	flag.Parse()
 
 	var level slog.Level
-	err := level.UnmarshalText([]byte(*logLevel))
+	err := level.UnmarshalText([]byte(logLevel))
 	if err != nil {
 		slog.Error("Invalid log level", "error", err)
 		os.Exit(1)
@@ -364,27 +375,27 @@ func main() {
 		Level: level,
 	})))
 
-	if *redirectsFile == "" || *certsFile == "" {
+	if redirectsFile == "" || certsFile == "" {
 		slog.Error("Both --redirects and --certs flags are required")
 		os.Exit(1)
 	}
 
 	// Initialize server configuration
 	config := &ServerConfig{
-		HTTPPort:  *httpPort,
-		HTTPSPort: *httpsPort,
-		Host:      *host,
+		HTTPPort:  httpPort,
+		HTTPSPort: httpsPort,
+		Host:      host,
 	}
 
 	// Load redirect rules
-	rules, err := loadRedirectionRules(*redirectsFile)
+	rules, err := loadRedirectionRules(redirectsFile)
 	if err != nil {
 		slog.Error("Error loading redirect rules", "error", err)
 		os.Exit(1)
 	}
 
 	// Load certificate mappings
-	certMaps, defaultCert, err := loadCertMappings(*certsFile)
+	certMaps, defaultCert, err := loadCertMappings(certsFile)
 	if err != nil {
 		slog.Error("Error loading certificate mappings", "error", err)
 		os.Exit(1)
