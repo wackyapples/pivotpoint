@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
 	"flag"
@@ -11,12 +10,34 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 )
+
+const usage = `Usage: pivotpoint [options]
+
+PivotPoint server
+
+Options:
+  -h, --help
+    	Show this help message
+  --redirects, -r REDIRECTS
+    	Redirects configuration file
+  --certs, -c CERTS
+    	Certificates configuration file
+  --http-port, -p HTTP_PORT
+    	HTTP port to listen on (default: 8080)
+  --https-port, -s HTTPS_PORT
+    	HTTPS port to listen on (default: 8443)
+  --host, -H HOST
+    	Host to listen on (default: all interfaces)
+  --log-level, -l {debug,info,warn,error}
+    	Log level (debug, info, warn, error)
+  --log-format, -f {text,json}
+    	Log format (text, json)
+`
 
 // Configuration for a single redirect rule
 type RedirectRule struct {
@@ -170,52 +191,32 @@ func loadRedirectionRules(configFile string) (*RedirectRules, error) {
 	}
 	defer file.Close()
 
-	rules := NewRedirectRules()
-	scanner := bufio.NewScanner(file)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		parts := strings.Fields(line)
-		if len(parts) < 2 {
-			slog.Error("Invalid line in config", "line", line)
-			continue
-		}
-
-		host := parts[0]
-		targetURL := parts[1]
-		rule := NewRedirectRule(targetURL)
-		slog.Debug("Adding rule", "host", host, "target", targetURL)
-
-		// Parse options
-		for _, opt := range parts[2:] {
-			optParts := strings.Split(opt, "=")
-			if len(optParts) != 2 {
-				slog.Error("Invalid option", "option", opt)
-				continue
-			}
-
-			switch optParts[0] {
-			case "type":
-				if redirectType, err := strconv.Atoi(optParts[1]); err == nil {
-					if redirectType == http.StatusMovedPermanently || redirectType == http.StatusFound {
-						rule.RedirectType = redirectType
-					}
-				}
-			case "preserve_path":
-				rule.PreservePath = optParts[1] == "yes"
-			case "https_first":
-				rule.HTTPSFirst = optParts[1] == "yes"
-			}
-		}
-
-		rules.AddRule(host, rule)
+	data, err := ParseConfig(file)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing TOML: %v", err)
 	}
 
-	return rules, scanner.Err()
+	redirectConfigs, err := ParseRedirectConfigs(data)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing redirect configs: %v", err)
+	}
+
+	rules := NewRedirectRules()
+	for _, config := range redirectConfigs {
+		rule := NewRedirectRule(config.TargetURL)
+		rule.RedirectType = config.RedirectType
+		rule.PreservePath = config.PreservePath
+		rule.HTTPSFirst = config.HTTPSFirst
+		rules.AddRule(config.SourceDomain, rule)
+		slog.Debug("Added redirect rule",
+			"source", config.SourceDomain,
+			"target", config.TargetURL,
+			"type", config.RedirectType,
+			"preserve_path", config.PreservePath,
+			"https_first", config.HTTPSFirst)
+	}
+
+	return rules, nil
 }
 
 // Load certificate configurations from the specified file
@@ -226,46 +227,44 @@ func loadCertMappings(configFile string) (map[string]*tls.Config, *tls.Config, e
 	}
 	defer file.Close()
 
+	data, err := ParseConfig(file)
+	if err != nil {
+		return nil, nil, fmt.Errorf("error parsing TOML: %v", err)
+	}
+
+	certConfigs, err := ParseCertConfigs(data)
+	if err != nil {
+		return nil, nil, fmt.Errorf("error parsing certificate configs: %v", err)
+	}
+
 	certMaps := make(map[string]*tls.Config)
 	var defaultCert *tls.Config
-	scanner := bufio.NewScanner(file)
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		parts := strings.Fields(line)
-		if len(parts) != 3 {
-			slog.Error("Invalid line in cert config", "line", line)
-			continue
-		}
-
-		host := parts[0]
-		certFile := parts[1]
-		keyFile := parts[2]
-
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	for _, config := range certConfigs {
+		cert, err := tls.LoadX509KeyPair(config.CertFile, config.KeyFile)
 		if err != nil {
-			slog.Error("Error loading certificate", "host", host, "error", err)
+			slog.Error("Error loading certificate",
+				"domain", config.Domain,
+				"error", err)
 			continue
 		}
 
-		config := &tls.Config{
+		tlsConfig := &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
 		}
 
-		if host == "default" {
-			defaultCert = config
+		if config.Domain == "default" {
+			defaultCert = tlsConfig
 		} else {
-			certMaps[host] = config
-			slog.Debug("Loaded certificate", "host", host, "cert", certFile)
+			certMaps[config.Domain] = tlsConfig
+			slog.Debug("Loaded certificate",
+				"domain", config.Domain,
+				"cert_file", config.CertFile)
 		}
 	}
 
-	return certMaps, defaultCert, scanner.Err()
+	return certMaps, defaultCert, nil
 }
 
 // Run the HTTP and HTTPS servers in parallel
@@ -351,6 +350,7 @@ func main() {
 	var httpsPort int
 	var host string
 	var logLevel string
+	var logFormat string
 	flag.StringVar(&redirectsFile, "redirects", "", "Redirects configuration file")
 	flag.StringVar(&redirectsFile, "r", "", "Redirects configuration file")
 	flag.StringVar(&certsFile, "certs", "", "Certificates configuration file")
@@ -358,10 +358,16 @@ func main() {
 	flag.IntVar(&httpPort, "http-port", 8080, "HTTP port to listen on")
 	flag.IntVar(&httpPort, "p", 8080, "HTTP port to listen on")
 	flag.IntVar(&httpsPort, "https-port", 8443, "HTTPS port to listen on")
+	flag.IntVar(&httpsPort, "s", 8443, "HTTPS port to listen on")
 	flag.StringVar(&host, "host", "", "Host to listen on")
 	flag.StringVar(&host, "H", "", "Host to listen on")
 	flag.StringVar(&logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 	flag.StringVar(&logLevel, "l", "info", "Log level (debug, info, warn, error)")
+	flag.StringVar(&logFormat, "log-format", "text", "Log format (text, json)")
+	flag.StringVar(&logFormat, "f", "text", "Log format (text, json)")
+	flag.Usage = func() {
+		fmt.Fprint(os.Stderr, usage)
+	}
 	flag.Parse()
 
 	var level slog.Level
@@ -371,9 +377,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: level,
-	})))
+	var handler slog.Handler
+	if logFormat == "json" {
+		handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+			Level: level,
+		})
+	} else {
+		handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+			Level: level,
+		})
+	}
+	slog.SetDefault(slog.New(handler))
 
 	if redirectsFile == "" || certsFile == "" {
 		slog.Error("Both --redirects and --certs flags are required")
