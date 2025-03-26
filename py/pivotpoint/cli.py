@@ -1,31 +1,17 @@
 import argparse
-import threading
 
 import slog
-from server import (
-    RedirectHandler,
-    SNITCPServer,
-    load_cert_mappings,
-    load_server_config,
-    run_server,
-)
-
+from server import run_server
+from config import parse_config
 
 def get_args():
     parser = argparse.ArgumentParser(description="PivotPoint server")
     parser.add_argument(
-        "--redirects",
-        "-r",
-        type=str,
-        required=True,
-        help="Redirects configuration file",
-    )
-    parser.add_argument(
-        "--certs",
+        "--config",
         "-c",
         type=str,
         required=True,
-        help="Certificates configuration file",
+        help="Configuration file",
     )
     parser.add_argument(
         "--http-port",
@@ -74,8 +60,6 @@ def main():
         "https_port": args.https_port,
         "http_port": args.http_port,
         "host": args.host,
-        "certs_file": args.certs,
-        "redirects_file": args.redirects,
     }
 
     # Configure logging
@@ -86,5 +70,7 @@ def main():
         else slog.TextHandler(level=level)
     )
     slog.set_default(slog.Logger(handler))
+    
+    redirects, certs, server_config = parse_config(args.config)
 
-    run_server(server_config)
+    run_server(redirects, certs, server_config)

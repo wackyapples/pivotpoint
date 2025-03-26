@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import http.server
 import socket
 import socketserver
@@ -10,7 +12,9 @@ from typing import Any
 from urllib.parse import urlparse
 
 import slog
+from config import parse_config, ServerConfig, CertConfig, RedirectConfig
 
+CertMappings = dict[str, ssl.SSLContext]
 
 @dataclass
 class RedirectRule:
@@ -30,7 +34,9 @@ class RedirectRule:
         return self.target_url
 
     def __hash__(self):
-        return hash((self.target_url, self.preserve_path, self.https_first))
+        return hash(
+            (self.target_url, self.redirect_type, self.preserve_path, self.https_first)
+        )
 
 
 class RedirectRules:
@@ -124,8 +130,11 @@ class RedirectHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-        logger.info(
-            f"Redirected HTTP request for {host}{self.path} to HTTPS {https_url}"
+        slog.info(
+            "Redirected",
+            host=host,
+            path=self.path,
+            https_url=https_url,
         )
 
     def perform_redirect(self, host: str):
@@ -135,7 +144,7 @@ class RedirectHandler(http.server.BaseHTTPRequestHandler):
             self._apply_redirect(rule, host)
             return
 
-        logger.warning(f"No destination found for host: {host}")
+        slog.warning("No destination found for host", host=host)
         self.send_response(404)
         self.end_headers()
 
@@ -156,8 +165,12 @@ class RedirectHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-        logger.info(
-            f"Redirected {host}{self.path} to {full_url} (type: {rule.redirect_type})"
+        slog.info(
+            "Redirected",
+            host=host,
+            path=self.path,
+            full_url=full_url,
+            redirect_type=rule.redirect_type,
         )
 
     # Override to suppress request logging to stderr
@@ -278,65 +291,32 @@ def parse_config_line(line: str) -> tuple[str, str, list[str]]:
     return parts[0], parts[1], parts[2:]
 
 
-def load_redirection_rules(config_file: str | Path) -> RedirectRules:
+def load_redirection_rules(redirects: list[RedirectConfig]) -> RedirectRules:
     """
-    Parse the configuration file and return a RedirectRules object.
-    Format: source_domain target_url [options...]
+    Load redirection rules from a list of RedirectConfig objects.
     """
-    if not isinstance(config_file, Path):
-        config_file = Path(config_file)
-
-    if not config_file.exists():
-        slog.warn("Configuration file not found", file=str(config_file))
-        return RedirectRules()
-
     rules = RedirectRules()
-    with config_file.open("r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
 
-            # Split into source, target, and options
-            host, target_url, options = parse_config_line(line)
-            if host is None:
-                continue
+    for redirect in redirects:
+        host = redirect.source_domain
+        target_url = redirect.target_url
+        redirect_type = redirect.redirect_type
+        preserve_path = redirect.preserve_path
+        https_first = redirect.https_first
 
-            # Parse options
-            redirect_type = 301
-            preserve_path = True
-            https_first = False
+        if redirect_type not in (301, 302):
+            slog.warn("Invalid redirect type", host=host, type=redirect_type)
+            continue
 
-            for option in options:
-                if option.startswith("type="):
-                    try:
-                        redirect_type = int(option.split("=")[1])
-                        if redirect_type not in (301, 302):
-                            slog.warn(
-                                "Invalid redirect type", host=host, type=redirect_type
-                            )
-                            continue
-                    except ValueError:
-                        slog.warn(
-                            "Invalid redirect type format", host=host, option=option
-                        )
-                        continue
-
-                elif option.startswith("preserve_path="):
-                    value = option.split("=")[1].lower()
-                    preserve_path = value == "yes"
-
-                elif option.startswith("https_first="):
-                    value = option.split("=")[1].lower()
-                    https_first = value == "yes"
-
-            rule = RedirectRule(
-                target_url=target_url,
-                redirect_type=redirect_type,
-                preserve_path=preserve_path,
-                https_first=https_first,
+        if host == "default":
+            rules.default_rule = RedirectRule(
+                target_url, redirect_type, preserve_path, https_first
             )
-            rules.add_rule(host, rule)
+        else:
+            rules.add_rule(
+                host,
+                RedirectRule(target_url, redirect_type, preserve_path, https_first),
+            )
 
     return rules
 
@@ -375,46 +355,44 @@ def load_cert_context(cert_file: str | Path, key_file: str | Path) -> ssl.SSLCon
 
 @lru_cache(maxsize=1)
 def load_cert_mappings(
-    config_file: str | Path,
-) -> tuple[dict[str, ssl.SSLContext], ssl.SSLContext | None]:
+    certs: list[CertConfig],
+) -> tuple[CertMappings, ssl.SSLContext | None]:
     """
-    Load certificate mappings from configuration file.
+    Load certificate mappings from a list of CertConfig objects.
 
     Returns:
         tuple: (cert_mappings, default_context)
         cert_mappings is a dictionary mapping hostnames to SSL contexts
         default_context is the default SSL context
     """
-    if not isinstance(config_file, Path):
-        config_file = Path(config_file)
-
-    if not config_file.exists():
-        slog.warn("Certificate configuration file not found", file=str(config_file))
-        return {}, None
-
     cert_mappings: dict[str, ssl.SSLContext] = {}
     default_context = None
 
-    with config_file.open("r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            host, cert_info = line.split(" ", 1)
-            cert_file, key_file = cert_info.split(" ", 1)
-
-            if host == "default":
-                default_context = load_cert_context(cert_file, key_file)
-                continue
-
-            try:
-                context = load_cert_context(cert_file, key_file)
-                cert_mappings[host] = context
-                slog.info("Loaded certificate", host=host, cert_file=cert_file)
-            except Exception as e:
-                slog.error("Error loading certificate", host=host, error=str(e))
+    for cert in certs:
+        try:
+            context = load_cert_context(cert.cert_file, cert.key_file)
+            cert_mappings[cert.domain] = context
+            if cert.domain == "default":
+                default_context = context
+            slog.info("Loaded certificate", host=cert.domain, cert_file=cert.cert_file)
+        except Exception as e:
+            slog.error("Error loading certificate", host=cert.domain, error=str(e))
 
     return cert_mappings, default_context
+
+
+def load_config(
+    config_file: str | Path,
+) -> tuple[RedirectRules, CertMappings, ServerConfig]:
+    """
+    Load server configuration, certificate mappings, and redirection rules from a file.
+    """
+    redirects, certs, server_config = parse_config(config_file)
+    return (
+        load_redirection_rules(redirects),
+        load_cert_mappings(certs),
+        server_config,
+    )
 
 
 def load_server_config(config_file: str | Path) -> dict[str, Any]:
@@ -441,29 +419,30 @@ def load_server_config(config_file: str | Path) -> dict[str, Any]:
     return server_config
 
 
-def run_server(server_config: dict[str, Any]):
+def run_server(redirect_rules: RedirectRules, cert_mappings: CertMappings, server_config: ServerConfig):
     """
     Run the server with the given configuration.
     """
+    http_server = None
+    https_server = None
     try:
-        cert_mappings, default_context = load_cert_mappings(server_config["certs_file"])
-
-        redirects = load_redirection_rules(server_config["redirects_file"])
+        
+        default_context = cert_mappings.get("default")
 
         handler = RedirectHandler
         https_server = SNITCPServer(
-            (server_config["host"], server_config["https_port"]),
+            (server_config.host, server_config.https_port),
             handler,
-            redirects,
+            redirect_rules,
             cert_mappings,
             server_config,
             default_context,
         )
 
         http_server = SNITCPServer(
-            (server_config["host"], server_config["http_port"]),
+            (server_config.host, server_config.http_port),
             handler,
-            redirects,
+            redirect_rules,
             {},
             server_config,
             None,
