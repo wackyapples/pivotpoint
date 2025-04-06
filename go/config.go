@@ -6,6 +6,8 @@ import (
 	"io"
 	"strconv"
 	"strings"
+
+	"log/slog"
 )
 
 // TOMLData represents the parsed TOML data structure
@@ -27,11 +29,18 @@ type CertConfig struct {
 	KeyFile  string
 }
 
+type ServerConfig struct {
+	HTTPPort  int
+	HTTPSPort int
+	Host      string
+	LogLevel  slog.Level
+	LogFormat string
+}
+
 // ParseConfig reads TOML data from a reader and returns a map of the parsed data
 func ParseConfig(r io.Reader) (TOMLData, error) {
 	data := make(TOMLData)
 	currentSection := data
-	// var currentArray []any
 	var inArray bool
 	var arrayKey string
 	var currentArrayItem TOMLData
@@ -116,9 +125,9 @@ func parseValue(value string) (any, error) {
 
 	// Try parsing as boolean
 	switch v := strings.ToLower(value); v {
-	case "true", "1", "yes", "on":
+	case "true", "yes", "on":
 		return true, nil
-	case "false", "0", "no", "off":
+	case "false", "no", "off":
 		return false, nil
 	}
 
@@ -214,7 +223,7 @@ func ParseCertConfigs(data TOMLData) ([]CertConfig, error) {
 		if !ok {
 			return nil, fmt.Errorf("missing or invalid key_file at index %d", i)
 		}
-		
+
 		config := CertConfig{
 			Domain:   domain,
 			CertFile: certFile,
@@ -225,4 +234,87 @@ func ParseCertConfigs(data TOMLData) ([]CertConfig, error) {
 	}
 
 	return configs, nil
+}
+
+// ParseServerConfig parses server configurations from TOML data
+func ParseServerConfig(data TOMLData) (*ServerConfig, error) {
+	serverSection, ok := data["server"].(TOMLData)
+	if !ok {
+		// Return default config if server section is not present
+		return &ServerConfig{
+			HTTPPort:  8080,
+			HTTPSPort: 8443,
+			Host:      "",
+			LogLevel:  slog.LevelInfo,
+			LogFormat: "text",
+		}, nil
+	}
+
+	// Default values
+	config := ServerConfig{
+		HTTPPort:  8080,
+		HTTPSPort: 8443,
+		Host:      "",
+		LogLevel:  slog.LevelInfo,
+		LogFormat: "text",
+	}
+
+	// Parse host if present
+	if host, ok := serverSection["host"].(string); ok {
+		config.Host = host
+	}
+
+	// Parse http_port if present
+	if httpPort, ok := serverSection["http_port"].(int64); ok {
+		config.HTTPPort = int(httpPort)
+	}
+
+	// Parse https_port if present
+	if httpsPort, ok := serverSection["https_port"].(int64); ok {
+		config.HTTPSPort = int(httpsPort)
+	}
+
+	// Parse log_level if present
+	if logLevel, ok := serverSection["log_level"].(string); ok {
+		var level slog.Level
+		err := level.UnmarshalText([]byte(logLevel))
+		if err != nil {
+			return nil, fmt.Errorf("invalid log_level: %v", err)
+		}
+		config.LogLevel = level
+	}
+
+	// Parse log_format if present
+	if logFormat, ok := serverSection["log_format"].(string); ok {
+		if logFormat != "json" && logFormat != "text" {
+			return nil, fmt.Errorf("invalid log_format: %s", logFormat)
+		}
+		config.LogFormat = logFormat
+	}
+
+	return &config, nil
+}
+
+// MergeServerConfig merges CLI options with config file options, with CLI options taking precedence
+func MergeServerConfig(baseConfig *ServerConfig, cliHTTPPort int, cliHTTPSPort int, cliHost string, cliLogLevel slog.Level, cliLogFormat string) *ServerConfig {
+	mergedConfig := *baseConfig // Create a copy of the base config
+
+	// Override with CLI options if they are set (non-zero values)
+	if cliHTTPPort != 0 {
+		mergedConfig.HTTPPort = cliHTTPPort
+	}
+	if cliHTTPSPort != 0 {
+		mergedConfig.HTTPSPort = cliHTTPSPort
+	}
+	if cliHost != "" {
+		mergedConfig.Host = cliHost
+	}
+	if cliLogLevel != 0 {
+		mergedConfig.LogLevel = cliLogLevel
+	}
+	if cliLogFormat != "" {
+		mergedConfig.LogFormat = cliLogFormat
+	}
+
+	return &mergedConfig
 }

@@ -23,10 +23,8 @@ PivotPoint server
 Options:
   -h, --help
     	Show this help message
-  --redirects, -r REDIRECTS
-    	Redirects configuration file
-  --certs, -c CERTS
-    	Certificates configuration file
+  --config, -c CONFIG
+    	Configuration file
   --http-port, -p HTTP_PORT
     	HTTP port to listen on (default: 8080)
   --https-port, -s HTTPS_PORT
@@ -47,12 +45,6 @@ type RedirectRule struct {
 	HTTPSFirst    bool
 	parsedTarget  *url.URL
 	parsedTargetM sync.Once
-}
-
-type ServerConfig struct {
-	HTTPPort  int
-	HTTPSPort int
-	Host      string
 }
 
 // RedirectRules container for optimized rule matching
@@ -184,19 +176,9 @@ func (h *RedirectHandler) applyRedirect(w http.ResponseWriter, r *http.Request, 
 }
 
 // Load and parse the redirect configuration file
-func loadRedirectionRules(configFile string) (*RedirectRules, error) {
-	file, err := os.Open(configFile)
-	if err != nil {
-		return nil, fmt.Errorf("error opening config file: %v", err)
-	}
-	defer file.Close()
+func loadRedirectionRules(configData TOMLData) (*RedirectRules, error) {
 
-	data, err := ParseConfig(file)
-	if err != nil {
-		return nil, fmt.Errorf("error parsing TOML: %v", err)
-	}
-
-	redirectConfigs, err := ParseRedirectConfigs(data)
+	redirectConfigs, err := ParseRedirectConfigs(configData)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing redirect configs: %v", err)
 	}
@@ -220,19 +202,8 @@ func loadRedirectionRules(configFile string) (*RedirectRules, error) {
 }
 
 // Load certificate configurations from the specified file
-func loadCertMappings(configFile string) (map[string]*tls.Config, *tls.Config, error) {
-	file, err := os.Open(configFile)
-	if err != nil {
-		return nil, nil, fmt.Errorf("error opening cert config file: %v", err)
-	}
-	defer file.Close()
-
-	data, err := ParseConfig(file)
-	if err != nil {
-		return nil, nil, fmt.Errorf("error parsing TOML: %v", err)
-	}
-
-	certConfigs, err := ParseCertConfigs(data)
+func loadCertMappings(configData TOMLData) (map[string]*tls.Config, *tls.Config, error) {
+	certConfigs, err := ParseCertConfigs(configData)
 	if err != nil {
 		return nil, nil, fmt.Errorf("error parsing certificate configs: %v", err)
 	}
@@ -344,72 +315,97 @@ func runServers(config *ServerConfig, rules *RedirectRules, certMaps map[string]
 
 func main() {
 	// Parse command line arguments
-	var redirectsFile string
-	var certsFile string
+	var configFile string
 	var httpPort int
 	var httpsPort int
 	var host string
 	var logLevel string
 	var logFormat string
-	flag.StringVar(&redirectsFile, "redirects", "", "Redirects configuration file")
-	flag.StringVar(&redirectsFile, "r", "", "Redirects configuration file")
-	flag.StringVar(&certsFile, "certs", "", "Certificates configuration file")
-	flag.StringVar(&certsFile, "c", "", "Certificates configuration file")
-	flag.IntVar(&httpPort, "http-port", 8080, "HTTP port to listen on")
-	flag.IntVar(&httpPort, "p", 8080, "HTTP port to listen on")
-	flag.IntVar(&httpsPort, "https-port", 8443, "HTTPS port to listen on")
-	flag.IntVar(&httpsPort, "s", 8443, "HTTPS port to listen on")
+	flag.StringVar(&configFile, "config", "", "Configuration file")
+	flag.StringVar(&configFile, "c", "", "Configuration file")
+	flag.IntVar(&httpPort, "http-port", 0, "HTTP port to listen on")
+	flag.IntVar(&httpPort, "p", 0, "HTTP port to listen on")
+	flag.IntVar(&httpsPort, "https-port", 0, "HTTPS port to listen on")
+	flag.IntVar(&httpsPort, "s", 0, "HTTPS port to listen on")
 	flag.StringVar(&host, "host", "", "Host to listen on")
 	flag.StringVar(&host, "H", "", "Host to listen on")
-	flag.StringVar(&logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
-	flag.StringVar(&logLevel, "l", "info", "Log level (debug, info, warn, error)")
-	flag.StringVar(&logFormat, "log-format", "text", "Log format (text, json)")
-	flag.StringVar(&logFormat, "f", "text", "Log format (text, json)")
+	flag.StringVar(&logLevel, "log-level", "", "Log level (debug, info, warn, error)")
+	flag.StringVar(&logLevel, "l", "", "Log level (debug, info, warn, error)")
+	flag.StringVar(&logFormat, "log-format", "", "Log format (text, json)")
+	flag.StringVar(&logFormat, "f", "", "Log format (text, json)")
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, usage)
 	}
 	flag.Parse()
 
-	var level slog.Level
-	err := level.UnmarshalText([]byte(logLevel))
-	if err != nil {
-		slog.Error("Invalid log level", "error", err)
+	// Parse log level from CLI if provided
+	var cliLogLevel slog.Level
+	if logLevel != "" {
+		err := cliLogLevel.UnmarshalText([]byte(logLevel))
+		if err != nil {
+			slog.Error("Invalid log level", "error", err)
+			os.Exit(1)
+		}
+	}
+
+	if configFile == "" {
+		slog.Error("Both --config flag is required")
 		os.Exit(1)
 	}
 
+	// Load configuration data from file
+	file, err := os.Open(configFile)
+	if err != nil {
+		slog.Error("Error opening config file", "error", err)
+		os.Exit(1)
+	}
+	defer file.Close()
+
+	configData, err := ParseConfig(file)
+	if err != nil {
+		slog.Error("Error loading config data", "error", err)
+		os.Exit(1)
+	}
+
+	// Load server config from TOML
+	var baseConfig *ServerConfig
+	baseConfig, err = ParseServerConfig(configData)
+	if err != nil {
+		slog.Error("Error parsing server config", "error", err)
+		os.Exit(1)
+	}
+
+	// Merge CLI options with config file options
+	config := MergeServerConfig(baseConfig, httpPort, httpsPort, host, cliLogLevel, logFormat)
+
+	// Set up logging based on the merged config
 	var handler slog.Handler
-	if logFormat == "json" {
+	if config.LogFormat == "json" {
 		handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-			Level: level,
+			Level: config.LogLevel,
 		})
 	} else {
 		handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-			Level: level,
+			Level: config.LogLevel,
 		})
 	}
 	slog.SetDefault(slog.New(handler))
 
-	if redirectsFile == "" || certsFile == "" {
-		slog.Error("Both --redirects and --certs flags are required")
-		os.Exit(1)
-	}
+	// Log the final configuration
+	slog.Info("Server configuration",
+		"http_port", config.HTTPPort,
+		"https_port", config.HTTPSPort,
+		"host", config.Host,
+		"log_level", config.LogLevel,
+		"log_format", config.LogFormat)
 
-	// Initialize server configuration
-	config := &ServerConfig{
-		HTTPPort:  httpPort,
-		HTTPSPort: httpsPort,
-		Host:      host,
-	}
-
-	// Load redirect rules
-	rules, err := loadRedirectionRules(redirectsFile)
+	rules, err := loadRedirectionRules(configData)
 	if err != nil {
 		slog.Error("Error loading redirect rules", "error", err)
 		os.Exit(1)
 	}
 
-	// Load certificate mappings
-	certMaps, defaultCert, err := loadCertMappings(certsFile)
+	certMaps, defaultCert, err := loadCertMappings(configData)
 	if err != nil {
 		slog.Error("Error loading certificate mappings", "error", err)
 		os.Exit(1)
